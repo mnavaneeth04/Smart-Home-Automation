@@ -1,0 +1,221 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+// Provide the token generation process info.
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+/* Wi-Fi Credentials */
+#define WIFI_SSID "WiFi Name"
+#define WIFI_PASSWORD "Wifi Password"
+
+/* Firebase API Credentials */
+#define API_KEY "Your API key"
+#define DATABASE_URL "Enter Database URL"
+
+#define USER_EMAIL "mahiamruthesh@gmail.com"
+#define USER_PASSWORD "Amruthesh@12"
+
+/* Firebase Object */
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* BLE Scan Settings */
+BLEScan *pBLEScan;
+int scanTime = 5; // Scan time in seconds
+
+/* GPIO Pins */
+#define LED_PIN 23 // GPIO pin for LED
+
+/* Control Flags and Timing */
+bool isDeviceMatched = false;
+unsigned long lastScanTime = 0; // Tracks the last time a scan was performed
+const unsigned long scanInterval = 30000; // Periodic scanning interval in milliseconds
+
+struct DeviceInfo {
+    String macID;
+    int priority;
+};
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Set LED pin as OUTPUT
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW); // Initially turn OFF LED
+
+    // Initialize Wi-Fi
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("Connecting to Wi-Fi");
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.print(".");
+        delay(500);
+    }
+    Serial.println("\nConnected to Wi-Fi!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    // Initialize Firebase
+    config.api_key = API_KEY;
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+    config.database_url = DATABASE_URL;
+
+    Firebase.reconnectNetwork(true);
+    Firebase.begin(&config, &auth);
+
+    // Initialize BLE
+    BLEDevice::init("ESP32_Bluetooth_Scanner");
+    pBLEScan = BLEDevice::getScan();
+    Serial.println("Bluetooth initialized. Scanning...");
+}
+
+void loop()
+{
+    unsigned long currentMillis = millis();
+
+    if (!isDeviceMatched || (currentMillis - lastScanTime >= scanInterval)) 
+    {
+        Serial.println("\nPerforming BLE scan...");
+        BLEScanResults* foundDevices = pBLEScan->start(scanTime, false); // Perform BLE scan
+        printAndProcessDevices(*foundDevices); // Pass scan results by reference
+        pBLEScan->clearResults(); // Clear scan results
+        lastScanTime = currentMillis; // Update the last scan time
+    }
+}
+
+void printAndProcessDevices(BLEScanResults &foundDevices)
+{
+    std::vector<DeviceInfo> deviceList;
+
+    Serial.printf("Found %d devices.\n", foundDevices.getCount());
+
+    for (int i = 0; i < foundDevices.getCount(); i++)
+    {
+        BLEAdvertisedDevice device = foundDevices.getDevice(i);
+        String macID = device.getAddress().toString().c_str();
+        Serial.printf("MAC ID Found: %s\n", macID.c_str());
+
+        int priority = 0;
+        if (verifyMACInDatabase(macID, priority))
+        {
+            Serial.printf("MAC ID %s matches user with priority %d.\n", macID.c_str(), priority);
+            deviceList.push_back({macID, priority});
+        }
+    }
+
+    if (!deviceList.empty())
+    {
+        // Sort devices by priority (lower number = higher priority)
+        std::sort(deviceList.begin(), deviceList.end(), [](DeviceInfo &a, DeviceInfo &b) {
+            return a.priority < b.priority;
+        });
+
+        // Handle the highest-priority device
+        Serial.printf("Handling LED behavior for MAC ID: %s\n", deviceList[0].macID.c_str());
+        handleLEDBehavior(deviceList[0].macID);
+        isDeviceMatched = true; // Prevent immediate re-processing
+    }
+    else
+    {
+        Serial.println("No matching MAC ID found in the database.");
+    }
+}
+
+bool verifyMACInDatabase(String macID, int &priority)
+{
+    // Paths to users' MAC IDs and priorities in the database
+    String paths[] = {"smarthome/users/user_1/mac_id", "smarthome/users/user_2/mac_id"};
+    String priorities[] = {"smarthome/users/user_1/priority", "smarthome/users/user_2/priority"};
+
+    for (int i = 0; i < 2; i++) // Loop through all users
+    {
+        String firebaseMAC;
+        if (Firebase.getString(fbdo, paths[i]))
+        {
+            firebaseMAC = fbdo.stringData();
+            if (firebaseMAC.equalsIgnoreCase(macID))
+            {
+                if (Firebase.getInt(fbdo, priorities[i]))
+                {
+                    priority = fbdo.intData();
+                }
+                Serial.printf("MAC ID %s verified at path: %s with priority: %d\n", macID.c_str(), paths[i].c_str(), priority);
+                return true;
+            }
+        }
+        else
+        {
+            Serial.printf("Error: %s\n", fbdo.errorReason().c_str());
+        }
+    }
+    return false;
+}
+
+void handleLEDBehavior(String macID)
+{
+    // Determine user light setting
+    String lightSetting = getLightSetting(macID);
+
+    if (lightSetting == "blink")
+    {
+        Serial.println("Blinking LED for 20 seconds.");
+        blinkLEDForDuration(20); // Blink LED for 20 seconds
+    }
+    else if (lightSetting == "HIGH")
+    {
+        Serial.println("LED ON for 20 seconds.");
+        digitalWrite(LED_PIN, HIGH);
+        delay(20000); // Keep LED ON for 20 seconds
+        digitalWrite(LED_PIN, LOW);
+    }
+    else
+    {
+        Serial.println("No valid light setting found. LED OFF");
+        digitalWrite(LED_PIN, LOW);
+    }
+
+    isDeviceMatched = false; // Allow new matches to be handled
+}
+
+String getLightSetting(String macID)
+{
+    // Check the light setting for each user
+    String lightPath = "";
+
+    if (Firebase.getString(fbdo, "smarthome/users/user_1/mac_id") && fbdo.stringData().equalsIgnoreCase(macID))
+    {
+        lightPath = "smarthome/users/user_1/settings/light";
+    }
+    else if (Firebase.getString(fbdo, "smarthome/users/user_2/mac_id") && fbdo.stringData().equalsIgnoreCase(macID))
+    {
+        lightPath = "smarthome/users/user_2/settings/light";
+    }
+
+    if (lightPath != "")
+    {
+        if (Firebase.getString(fbdo, lightPath))
+        {
+            return fbdo.stringData();
+        }
+    }
+    return ""; // Return empty if no setting found
+}
+
+void blinkLEDForDuration(int durationInSeconds)
+{
+    unsigned long startTime = millis();
+    while ((millis() - startTime) < (durationInSeconds * 1000))
+    {
+        digitalWrite(LED_PIN, HIGH);
+        delay(500);
+        digitalWrite(LED_PIN, LOW);
+        delay(500);
+    }
+}
